@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 TOKEN = os.getenv("DISCORD_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# CRITICAL: Intents must be enabled in Discord Dev Portal
+# CRITICAL: Ensure Message Content Intent is ON in the Discord Dev Portal
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True 
@@ -23,7 +23,7 @@ class StreakBot(commands.Bot):
     async def setup_hook(self):
         self.db_pool = await asyncpg.create_pool(DATABASE_URL)
         async with self.db_pool.acquire() as conn:
-            # User tracking table
+            # Table for tracking user progress
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS user_streaks (
                     user_id BIGINT,
@@ -34,7 +34,7 @@ class StreakBot(commands.Bot):
                     PRIMARY KEY (user_id, guild_id)
                 )
             ''')
-            # Server config table
+            # Table for server-specific settings
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS guild_settings (
                     guild_id BIGINT PRIMARY KEY,
@@ -56,15 +56,16 @@ async def fire_streak_webhook(guild_id, user, streak_count):
     if not url:
         return
 
+    # UPDATED: Removed () from streak number and updated UhOkay emoji ID
     content = (
-        f"<:Sneeze:1495243609035899023> {user.mention}, You've acquired a Message Streak :UhOkay:\n"
-        f"**Message Streak: ({streak_count})**"
+        f"<:Sneeze:1495243609035899023> {user.mention}, You've acquired a Message Streak <:UhOkay:1495243635132731702>\n"
+        f"**Message Streak: {streak_count}**"
     )
     
     async with aiohttp.ClientSession() as session:
         try:
             webhook = discord.Webhook.from_url(url, session=session)
-            await webhook.send(content=content, username="Streak Tracker")
+            await webhook.send(content=content) # No username override
         except Exception as e:
             print(f"⚠️ Webhook error: {e}")
 
@@ -84,7 +85,7 @@ async def check_and_assign_roles(member, streak_count):
                 try:
                     await member.add_roles(role)
                 except:
-                    print(f"❌ Failed to add role in {member.guild.name} (Check hierarchy)")
+                    print(f"❌ Role Error: Check hierarchy for {member.guild.name}")
 
 # --- SLASH COMMANDS ---
 
@@ -102,8 +103,8 @@ async def set_webhook(interaction: discord.Interaction, url: str):
 
 @bot.tree.command(name="streak_roles", description="Set roles for milestones")
 async def streak_roles(interaction: discord.Interaction, 
-                       s2: discord.Role, s7: discord.Role, s14: discord.Role,
-                       s30: discord.Role, s50: discord.Role, s100: discord.Role):
+                       streak2: discord.Role, streak7: discord.Role, streak14: discord.Role,
+                       streak30: discord.Role, streak50: discord.Role, streak100: discord.Role):
     if not interaction.user.guild_permissions.manage_roles:
         return await interaction.response.send_message("❌ Admin only.", ephemeral=True)
 
@@ -113,7 +114,7 @@ async def streak_roles(interaction: discord.Interaction,
             VALUES ($1, $2, $3, $4, $5, $6, $7)
             ON CONFLICT (guild_id) DO UPDATE SET 
             role_2=$2, role_7=$3, role_14=$4, role_30=$5, role_50=$6, role_100=$7
-        ''', interaction.guild_id, s2.id, s7.id, s14.id, s30.id, s50.id, s100.id)
+        ''', interaction.guild_id, streak2.id, streak7.id, streak14.id, streak30.id, streak50.id, streak100.id)
     await interaction.response.send_message("✅ Milestone roles updated!", ephemeral=True)
 
 # --- THE LOGIC ---
@@ -129,44 +130,40 @@ async def on_message(message):
     async with bot.db_pool.acquire() as conn:
         user = await conn.fetchrow("SELECT * FROM user_streaks WHERE user_id = $1 AND guild_id = $2", uid, gid)
 
-        # 1. New user setup
         if not user:
             await conn.execute('''
                 INSERT INTO user_streaks (user_id, guild_id, messages_today, last_streak_date) 
                 VALUES ($1, $2, 1, $3)
             ''', uid, gid, today - timedelta(days=1))
-            print(f"📝 New user {message.author} added to DB.")
             return
 
         last_date = user['last_streak_date']
         current_streak = user['current_streak']
         msgs_today = user['messages_today']
 
-        # 2. Check if they already finished today
+        # If they already hit their streak today, stop here
         if last_date == today:
             return
 
-        # 3. Check for Streak Reset (if they missed yesterday)
+        # Reset streak if they missed more than 1 day
         if last_date < today - timedelta(days=1):
             current_streak = 0
-            print(f"💀 {message.author}'s streak was reset.")
 
-        # 4. Increment message count
-        new_msgs = msgs_today + 1 if last_date < today else msgs_today + 1
+        # Increment message count
+        new_msgs = msgs_today + 1
 
         if new_msgs >= 3:
-            # STREAK EARNED
+            # STREAK SUCCESS
             new_streak = current_streak + 1
             await conn.execute('''
                 UPDATE user_streaks SET current_streak = $1, messages_today = 0, last_streak_date = $2 
                 WHERE user_id = $3 AND guild_id = $4
             ''', new_streak, today, uid, gid)
             
-            print(f"🔥 {message.author} hit a {new_streak} day streak!")
             await fire_streak_webhook(gid, message.author, new_streak)
             await check_and_assign_roles(message.author, new_streak)
         else:
-            # Just incrementing count
+            # Just count the message
             await conn.execute('''
                 UPDATE user_streaks SET messages_today = $1, current_streak = $2
                 WHERE user_id = $3 AND guild_id = $4
