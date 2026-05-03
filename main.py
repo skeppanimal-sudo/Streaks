@@ -218,7 +218,7 @@ async def on_message(message):
             ''', new_streak, today, uid, gid)
             
             # Fire Success Webhook
-            await fire_webhook(gid, f"🔥 {message.author.mention}, You've acquired a Message Streak 🔥\n**Message Streak: {new_streak}**")
+            await fire_webhook(gid, f"🔥 {message.author.mention}, You've acquired a Message Streak! 🔥\n**Message Streak: {new_streak}**")
             
             # Assign roles
             await check_and_assign_roles(message.author, new_streak)
