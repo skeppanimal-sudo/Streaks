@@ -56,7 +56,6 @@ async def remove_all_streak_roles(member):
     
     if not row: return
 
-    # Gather all IDs from settings
     role_keys = ['role_2', 'role_7', 'role_14', 'role_30', 'role_50', 'role_100']
     roles_to_remove = []
     
@@ -75,14 +74,14 @@ async def remove_all_streak_roles(member):
             print(f"❌ Failed to remove roles: {e}")
 
 async def fire_streak_webhook(guild_id, user, streak_count):
-    """Sends the announcement via the configured webhook."""
+    """Sends the announcement via the configured webhook using fire emojis."""
     async with bot.db_pool.acquire() as conn:
         url = await conn.fetchval("SELECT webhook_url FROM guild_settings WHERE guild_id = $1", guild_id)
     
     if not url: return
 
     content = (
-        f"<:Sneeze:1495243609035899023> {user.mention}, You've acquired a Message Streak <:UhOkay:1495243635132731702>\n"
+        f"🔥 {user.mention}, You've acquired a Message Streak 🔥\n"
         f"**Message Streak: {streak_count}**"
     )
     
@@ -166,11 +165,10 @@ async def on_message(message):
         current_streak = user['current_streak']
         msgs_today = user['messages_today']
 
-        # Prevent double counting if they already hit their streak today
         if last_date == today:
             return
 
-        # STREAK RESET: If user missed more than 1 full day
+        # STREAK RESET: User missed more than 1 day
         if last_date < today - timedelta(days=1):
             current_streak = 0
             await remove_all_streak_roles(message.author)
@@ -188,7 +186,7 @@ async def on_message(message):
             await fire_streak_webhook(gid, message.author, new_streak)
             await check_and_assign_roles(message.author, new_streak)
         else:
-            # Incrementing daily count
+            # Updating current count for the day
             await conn.execute('''
                 UPDATE user_streaks SET messages_today = $1, current_streak = $2
                 WHERE user_id = $3 AND guild_id = $4
