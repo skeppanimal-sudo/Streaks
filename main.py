@@ -1,5 +1,5 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 import asyncpg
 import os
@@ -10,7 +10,6 @@ from datetime import datetime, timedelta, timezone
 TOKEN = os.getenv("DISCORD_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# CRITICAL: Intents must be enabled in Discord Dev Portal
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True 
@@ -21,9 +20,10 @@ class StreakBot(commands.Bot):
         self.db_pool = None
 
     async def setup_hook(self):
+        # Initialize Database Pool
         self.db_pool = await asyncpg.create_pool(DATABASE_URL)
         async with self.db_pool.acquire() as conn:
-            # Table for tracking user progress
+            # Table for streaks
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS user_streaks (
                     user_id BIGINT,
@@ -34,7 +34,7 @@ class StreakBot(commands.Bot):
                     PRIMARY KEY (user_id, guild_id)
                 )
             ''')
-            # Table for server-specific settings
+            # Table for settings
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS guild_settings (
                     guild_id BIGINT PRIMARY KEY,
@@ -43,20 +43,22 @@ class StreakBot(commands.Bot):
                     role_30 BIGINT, role_50 BIGINT, role_100 BIGINT
                 )
             ''')
-        print("✅ Database & Tables Ready")
+        # Start the background task
+        self.check_streak_expiry.start()
+        print("✅ Database Ready & Expiry Task Started")
 
 bot = StreakBot()
 
 # --- HELPERS ---
 
-async def remove_all_streak_roles(member, channel):
-    """Removes all milestone roles and sends a heartbreak message."""
+async def remove_all_streak_roles(member):
+    """Helper to wipe all streak-related roles from a member."""
     async with bot.db_pool.acquire() as conn:
         row = await conn.fetchrow("SELECT * FROM guild_settings WHERE guild_id = $1", member.guild.id)
     
-    if not row: return
+    if not row:
+        return
 
-    # Remove the roles
     role_keys = ['role_2', 'role_7', 'role_14', 'role_30', 'role_50', 'role_100']
     roles_to_remove = []
     
@@ -70,27 +72,18 @@ async def remove_all_streak_roles(member, channel):
     if roles_to_remove:
         try:
             await member.remove_roles(*roles_to_remove)
+            print(f"🧹 Roles cleared for {member.name}")
         except:
-            pass # Usually hierarchy issues
+            print(f"❌ Failed role removal for {member.name}")
 
-    # Send the loss message
-    try:
-        await channel.send(f"💔 {member.mention}, You've lost your message streak!")
-    except:
-        print(f"❌ Could not send loss message in {member.guild.name}")
-
-async def fire_streak_webhook(guild_id, user, streak_count):
-    """Sends the announcement via the configured webhook using fire emojis."""
+async def fire_webhook(guild_id, content):
+    """Universal helper to send messages via the guild's webhook."""
     async with bot.db_pool.acquire() as conn:
         url = await conn.fetchval("SELECT webhook_url FROM guild_settings WHERE guild_id = $1", guild_id)
     
-    if not url: return
+    if not url:
+        return
 
-    content = (
-        f"🔥 {user.mention}, You've acquired a Message Streak 🔥\n"
-        f"**Message Streak: {streak_count}**"
-    )
-    
     async with aiohttp.ClientSession() as session:
         try:
             webhook = discord.Webhook.from_url(url, session=session)
@@ -99,7 +92,7 @@ async def fire_streak_webhook(guild_id, user, streak_count):
             print(f"⚠️ Webhook error: {e}")
 
 async def check_and_assign_roles(member, streak_count):
-    """Assigns the specific role for a milestone reached."""
+    """Checks if a user hit a milestone and adds the role."""
     async with bot.db_pool.acquire() as conn:
         row = await conn.fetchrow("SELECT * FROM guild_settings WHERE guild_id = $1", member.guild.id)
     
@@ -115,7 +108,41 @@ async def check_and_assign_roles(member, streak_count):
                 try:
                     await member.add_roles(role)
                 except:
-                    print(f"❌ Role Error: Check hierarchy for {member.guild.name}")
+                    print(f"❌ Hierarchy Error in {member.guild.name}")
+
+# --- BACKGROUND TASK: AUTOMATIC EXPIRY ---
+
+@tasks.loop(hours=1)
+async def check_streak_expiry():
+    """Wipes streaks and pings users the moment they miss their 24h window."""
+    if not bot.db_pool:
+        return
+    
+    yesterday = datetime.now(timezone.utc).date() - timedelta(days=1)
+    
+    async with bot.db_pool.acquire() as conn:
+        # Find active streaks that haven't been updated since before yesterday
+        expired = await conn.fetch(
+            "SELECT user_id, guild_id FROM user_streaks WHERE last_streak_date < $1 AND current_streak > 0", 
+            yesterday
+        )
+
+        for record in expired:
+            guild = bot.get_guild(record['guild_id'])
+            if not guild: continue
+            
+            member = guild.get_member(record['user_id'])
+            if not member: continue
+
+            # Reset in DB
+            await conn.execute(
+                "UPDATE user_streaks SET current_streak = 0, messages_today = 0 WHERE user_id = $1 AND guild_id = $2",
+                record['user_id'], record['guild_id']
+            )
+
+            # Strip roles and ping
+            await remove_all_streak_roles(member)
+            await fire_webhook(record['guild_id'], f"💔 {member.mention}, You've lost your message streak!")
 
 # --- SLASH COMMANDS ---
 
@@ -133,8 +160,8 @@ async def set_webhook(interaction: discord.Interaction, url: str):
 
 @bot.tree.command(name="streak_roles", description="Set roles for milestones")
 async def streak_roles(interaction: discord.Interaction, 
-                       streak2: discord.Role, streak7: discord.Role, streak14: discord.Role,
-                       streak30: discord.Role, streak50: discord.Role, streak100: discord.Role):
+                       s2: discord.Role, s7: discord.Role, s14: discord.Role,
+                       s30: discord.Role, s50: discord.Role, s100: discord.Role):
     if not interaction.user.guild_permissions.manage_roles:
         return await interaction.response.send_message("❌ Admin only.", ephemeral=True)
 
@@ -144,10 +171,10 @@ async def streak_roles(interaction: discord.Interaction,
             VALUES ($1, $2, $3, $4, $5, $6, $7)
             ON CONFLICT (guild_id) DO UPDATE SET 
             role_2=$2, role_7=$3, role_14=$4, role_30=$5, role_50=$6, role_100=$7
-        ''', interaction.guild_id, streak2.id, streak7.id, streak14.id, streak30.id, streak50.id, streak100.id)
-    await interaction.response.send_message("✅ Milestone roles updated!", ephemeral=True)
+        ''', interaction.guild_id, s2.id, s7.id, s14.id, s30.id, s50.id, s100.id)
+    await interaction.response.send_message("✅ Roles updated!", ephemeral=True)
 
-# --- THE LOGIC ---
+# --- MAIN MESSAGE LOGIC ---
 
 @bot.event
 async def on_message(message):
@@ -160,6 +187,7 @@ async def on_message(message):
     async with bot.db_pool.acquire() as conn:
         user = await conn.fetchrow("SELECT * FROM user_streaks WHERE user_id = $1 AND guild_id = $2", uid, gid)
 
+        # Initialize new user
         if not user:
             await conn.execute('''
                 INSERT INTO user_streaks (user_id, guild_id, messages_today, last_streak_date) 
@@ -167,33 +195,37 @@ async def on_message(message):
             ''', uid, gid, today - timedelta(days=1))
             return
 
-        last_date = user['last_streak_date']
-        current_streak = user['current_streak']
-        msgs_today = user['messages_today']
-
-        if last_date == today:
+        # Stop if they already hit streak today
+        if user['last_streak_date'] == today:
             return
 
-        # STREAK RESET
-        if last_date < today - timedelta(days=1):
+        current_streak = user['current_streak']
+        
+        # Check if they missed a day (Manual check in case task hasn't run yet)
+        if user['last_streak_date'] < today - timedelta(days=1):
             current_streak = 0
-            # Triggers role removal AND the 💔 loss message
-            await remove_all_streak_roles(message.author, message.channel)
+            await remove_all_streak_roles(message.author)
+            await fire_webhook(gid, f"💔 {message.author.mention}, You've lost your message streak!")
 
-        new_msgs = msgs_today + 1
+        new_msgs = user['messages_today'] + 1
 
         if new_msgs >= 3:
+            # SUCCESS
             new_streak = current_streak + 1
             await conn.execute('''
                 UPDATE user_streaks SET current_streak = $1, messages_today = 0, last_streak_date = $2 
                 WHERE user_id = $3 AND guild_id = $4
             ''', new_streak, today, uid, gid)
             
-            await fire_streak_webhook(gid, message.author, new_streak)
+            # Fire Success Webhook
+            await fire_webhook(gid, f"🔥 {message.author.mention}, You've acquired a Message Streak 🔥\n**Message Streak: {new_streak}**")
+            
+            # Assign roles
             await check_and_assign_roles(message.author, new_streak)
         else:
+            # Increment count
             await conn.execute('''
-                UPDATE user_streaks SET messages_today = $1, current_streak = $2
+                UPDATE user_streaks SET messages_today = $1, current_streak = $2 
                 WHERE user_id = $3 AND guild_id = $4
             ''', new_msgs, current_streak, uid, gid)
 
@@ -202,6 +234,6 @@ async def on_message(message):
 @bot.event
 async def on_ready():
     await bot.tree.sync()
-    print(f"🚀 Logged in as {bot.user} and Slash Commands Synced.")
+    print(f"🚀 {bot.user} is active.")
 
 bot.run(TOKEN)
