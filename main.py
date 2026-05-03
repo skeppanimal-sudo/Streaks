@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 TOKEN = os.getenv("DISCORD_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# CRITICAL: Ensure Message Content Intent is ON in the Discord Dev Portal
+# CRITICAL: Intents must be enabled in Discord Dev Portal
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True 
@@ -49,14 +49,38 @@ bot = StreakBot()
 
 # --- HELPERS ---
 
+async def remove_all_streak_roles(member):
+    """Removes all milestone roles when a streak is broken."""
+    async with bot.db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM guild_settings WHERE guild_id = $1", member.guild.id)
+    
+    if not row: return
+
+    # Gather all IDs from settings
+    role_keys = ['role_2', 'role_7', 'role_14', 'role_30', 'role_50', 'role_100']
+    roles_to_remove = []
+    
+    for key in role_keys:
+        r_id = row[key]
+        if r_id:
+            role = member.guild.get_role(r_id)
+            if role and role in member.roles:
+                roles_to_remove.append(role)
+
+    if roles_to_remove:
+        try:
+            await member.remove_roles(*roles_to_remove)
+            print(f"🧹 Removed {len(roles_to_remove)} roles from {member.name} due to streak loss.")
+        except Exception as e:
+            print(f"❌ Failed to remove roles: {e}")
+
 async def fire_streak_webhook(guild_id, user, streak_count):
+    """Sends the announcement via the configured webhook."""
     async with bot.db_pool.acquire() as conn:
         url = await conn.fetchval("SELECT webhook_url FROM guild_settings WHERE guild_id = $1", guild_id)
     
-    if not url:
-        return
+    if not url: return
 
-    # UPDATED: Removed () from streak number and updated UhOkay emoji ID
     content = (
         f"<:Sneeze:1495243609035899023> {user.mention}, You've acquired a Message Streak <:UhOkay:1495243635132731702>\n"
         f"**Message Streak: {streak_count}**"
@@ -65,11 +89,12 @@ async def fire_streak_webhook(guild_id, user, streak_count):
     async with aiohttp.ClientSession() as session:
         try:
             webhook = discord.Webhook.from_url(url, session=session)
-            await webhook.send(content=content) # No username override
+            await webhook.send(content=content)
         except Exception as e:
             print(f"⚠️ Webhook error: {e}")
 
 async def check_and_assign_roles(member, streak_count):
+    """Assigns the specific role for a milestone reached."""
     async with bot.db_pool.acquire() as conn:
         row = await conn.fetchrow("SELECT * FROM guild_settings WHERE guild_id = $1", member.guild.id)
     
@@ -141,19 +166,19 @@ async def on_message(message):
         current_streak = user['current_streak']
         msgs_today = user['messages_today']
 
-        # If they already hit their streak today, stop here
+        # Prevent double counting if they already hit their streak today
         if last_date == today:
             return
 
-        # Reset streak if they missed more than 1 day
+        # STREAK RESET: If user missed more than 1 full day
         if last_date < today - timedelta(days=1):
             current_streak = 0
+            await remove_all_streak_roles(message.author)
 
-        # Increment message count
         new_msgs = msgs_today + 1
 
         if new_msgs >= 3:
-            # STREAK SUCCESS
+            # STREAK ACHIEVED
             new_streak = current_streak + 1
             await conn.execute('''
                 UPDATE user_streaks SET current_streak = $1, messages_today = 0, last_streak_date = $2 
@@ -163,7 +188,7 @@ async def on_message(message):
             await fire_streak_webhook(gid, message.author, new_streak)
             await check_and_assign_roles(message.author, new_streak)
         else:
-            # Just count the message
+            # Incrementing daily count
             await conn.execute('''
                 UPDATE user_streaks SET messages_today = $1, current_streak = $2
                 WHERE user_id = $3 AND guild_id = $4
