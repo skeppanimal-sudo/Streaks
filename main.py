@@ -3,8 +3,10 @@ from discord.ext import commands, tasks
 from discord import app_commands
 import asyncpg
 import os
+import io
 import aiohttp
 from datetime import datetime, timedelta, timezone
+from easy_pillow import Editor, Canvas, Font, load_image
 
 # --- CONFIGURATION ---
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -23,7 +25,7 @@ class StreakBot(commands.Bot):
         # Initialize Database Pool
         self.db_pool = await asyncpg.create_pool(DATABASE_URL)
         async with self.db_pool.acquire() as conn:
-            # User tracking table
+            # Table for Streaks
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS user_streaks (
                     user_id BIGINT,
@@ -34,24 +36,29 @@ class StreakBot(commands.Bot):
                     PRIMARY KEY (user_id, guild_id)
                 )
             ''')
-            # Server settings table (Includes Nickname and Profile columns)
+            # Table for Global Message Counting and Ranking
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS message_stats (
+                    user_id BIGINT,
+                    guild_id BIGINT,
+                    total_messages INTEGER DEFAULT 0,
+                    PRIMARY KEY (user_id, guild_id)
+                )
+            ''')
+            # Table for Server Settings
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS guild_settings (
                     guild_id BIGINT PRIMARY KEY,
                     webhook_url TEXT,
-                    custom_name TEXT,
-                    custom_avatar TEXT,
                     role_2 BIGINT, role_7 BIGINT, role_14 BIGINT, 
                     role_30 BIGINT, role_50 BIGINT, role_100 BIGINT
                 )
             ''')
-        # Start the background task (Inside the class)
         self.check_streak_expiry.start()
-        print("✅ Database Ready & Expiry Task Started")
+        print("✅ Database & Tracking System Ready")
 
     @tasks.loop(hours=1)
     async def check_streak_expiry(self):
-        """Wipes streaks and pings users the moment they miss their 24h window."""
         if not self.db_pool: return
         today = datetime.now(timezone.utc).date()
         yesterday = today - timedelta(days=1)
@@ -61,19 +68,16 @@ class StreakBot(commands.Bot):
                 "SELECT user_id, guild_id FROM user_streaks WHERE last_streak_date < $1 AND current_streak > 0", 
                 yesterday
             )
-
             for record in expired:
                 guild = self.get_guild(record['guild_id'])
                 if not guild: continue
                 member = guild.get_member(record['user_id'])
                 if not member: continue
 
-                # Reset streak and LOCK date to today to prevent spam
                 await conn.execute('''
                     UPDATE user_streaks SET current_streak = 0, messages_today = 0, last_streak_date = $1 
                     WHERE user_id = $2 AND guild_id = $3
                 ''', today, record['user_id'], record['guild_id'])
-
                 await remove_all_streak_roles(member)
                 await fire_webhook(record['guild_id'], f"💔 {member.mention}, You've lost your message streak!")
 
@@ -82,78 +86,101 @@ bot = StreakBot()
 # --- HELPERS ---
 
 async def remove_all_streak_roles(member):
-    """Strips all streak roles from the user (Hardcore mode)."""
     async with bot.db_pool.acquire() as conn:
         row = await conn.fetchrow("SELECT * FROM guild_settings WHERE guild_id = $1", member.guild.id)
     if not row: return
-
     role_keys = ['role_2', 'role_7', 'role_14', 'role_30', 'role_50', 'role_100']
-    roles_to_remove = []
-    for key in role_keys:
-        r_id = row[key]
-        if r_id:
-            role = member.guild.get_role(r_id)
-            if role and role in member.roles:
-                roles_to_remove.append(role)
-
+    roles_to_remove = [member.guild.get_role(row[k]) for k in role_keys if row[k] and member.guild.get_role(row[k]) in member.roles]
     if roles_to_remove:
-        try:
-            await member.remove_roles(*roles_to_remove)
-        except:
-            print(f"❌ Hierarchy error in {member.guild.name}")
+        try: await member.remove_roles(*[r for r in roles_to_remove if r])
+        except: pass
 
 async def fire_webhook(guild_id, content):
-    """Sends webhook pings using server-specific Nick and Profile image."""
     async with bot.db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT webhook_url, custom_name, custom_avatar FROM guild_settings WHERE guild_id = $1", guild_id)
-    
+        row = await conn.fetchrow("SELECT webhook_url FROM guild_settings WHERE guild_id = $1", guild_id)
     if not row or not row['webhook_url']: return
-
     async with aiohttp.ClientSession() as session:
         try:
             webhook = discord.Webhook.from_url(row['webhook_url'], session=session)
-            await webhook.send(
-                content=content,
-                username=row['custom_name'] if row['custom_name'] else None,
-                avatar_url=row['custom_avatar'] if row['custom_avatar'] else None
-            )
-        except Exception as e:
-            print(f"⚠️ Webhook error: {e}")
+            await webhook.send(content=content)
+        except: pass
 
 async def check_and_assign_roles(member, streak_count):
-    """Grants the specific milestone role."""
     async with bot.db_pool.acquire() as conn:
         row = await conn.fetchrow("SELECT * FROM guild_settings WHERE guild_id = $1", member.guild.id)
     if not row: return
-
     milestones = {2: 'role_2', 7: 'role_7', 14: 'role_14', 30: 'role_30', 50: 'role_50', 100: 'role_100'}
     if streak_count in milestones:
-        role_id = row[milestones[streak_count]]
-        if role_id:
-            role = member.guild.get_role(role_id)
+        r_id = row[milestones[streak_count]]
+        if r_id:
+            role = member.guild.get_role(r_id)
             if role:
-                try:
-                    await member.add_roles(role)
-                except:
-                    pass
+                try: await member.add_roles(role)
+                except: pass
 
-# --- SLASH COMMANDS ---
+# --- IMAGE GENERATION ---
 
-@bot.tree.command(name="setnick", description="Set bot's name for streak messages in this server")
-async def set_nick(interaction: discord.Interaction, name: str):
-    if not interaction.user.guild_permissions.manage_guild:
-        return await interaction.response.send_message("❌ Admin only.", ephemeral=True)
+async def create_rank_card(user, msg_count, rank):
+    # Create Editor with background
+    try:
+        # Tries to load background.jpg from your folder
+        background = Editor("background.jpg").resize((900, 270))
+    except:
+        # Fallback if image isn't found
+        background = Editor(Canvas((900, 270), color="#1e1e1e"))
+
+    # Avatar processing
+    avatar_image = await load_image(str(user.display_avatar.url))
+    avatar = Editor(avatar_image).resize((170, 170)).circle_image()
+    
+    # Dark Overlay Box (Modern Rounded Look)
+    background.rectangle((25, 25), 850, 220, fill="#000000aa", radius=25)
+    
+    # Paste Avatar
+    background.paste(avatar, (50, 50))
+    
+    # Text Handling
+    white = "white"
+    blue = "#00d4ff"
+    yellow = "#ffcc4d"
+    
+    font_name = Font.poppins(variant="bold", size=45)
+    font_label = Font.poppins(variant="light", size=28)
+    font_value = Font.poppins(variant="bold", size=60)
+
+    # Name
+    background.text((250, 55), str(user.display_name), font=font_name, color=white)
+    
+    # Message Count Column
+    background.text((250, 130), "MESSAGE COUNT", font=font_label, color="#d1d1d1")
+    background.text((250, 170), str(msg_count), font=font_value, color=yellow)
+    
+    # Rank Column
+    background.text((600, 130), "SERVER RANK", font=font_label, color="#d1d1d1")
+    background.text((600, 170), f"#{rank}", font=font_value, color=blue)
+
+    # Convert to Discord File
+    file = discord.File(fp=background.image_bytes, filename="rank.png")
+    return file
+
+# --- COMMANDS ---
+
+@bot.tree.command(name="messages", description="View message count and rank card")
+async def messages(interaction: discord.Interaction, user: discord.Member = None):
+    user = user or interaction.user
+    await interaction.response.defer() # Defer because image processing takes time
+
     async with bot.db_pool.acquire() as conn:
-        await conn.execute("INSERT INTO guild_settings (guild_id, custom_name) VALUES ($1, $2) ON CONFLICT (guild_id) DO UPDATE SET custom_name = $2", interaction.guild_id, name)
-    await interaction.response.send_message(f"✅ Bot name set to: **{name}**", ephemeral=True)
+        # Get count
+        row = await conn.fetchrow("SELECT total_messages FROM message_stats WHERE user_id = $1 AND guild_id = $2", user.id, interaction.guild_id)
+        msg_count = row['total_messages'] if row else 0
+        
+        # Calculate Rank
+        rank_data = await conn.fetch("SELECT user_id FROM message_stats WHERE guild_id = $1 ORDER BY total_messages DESC", interaction.guild_id)
+        rank = next((i + 1 for i, r in enumerate(rank_data) if r['user_id'] == user.id), "N/A")
 
-@bot.tree.command(name="setprofile", description="Set bot's image URL for streak messages")
-async def set_profile(interaction: discord.Interaction, image_url: str):
-    if not interaction.user.guild_permissions.manage_guild:
-        return await interaction.response.send_message("❌ Admin only.", ephemeral=True)
-    async with bot.db_pool.acquire() as conn:
-        await conn.execute("INSERT INTO guild_settings (guild_id, custom_avatar) VALUES ($1, $2) ON CONFLICT (guild_id) DO UPDATE SET custom_avatar = $2", interaction.guild_id, image_url)
-    await interaction.response.send_message(f"✅ Bot profile image updated!", ephemeral=True)
+    card_file = await create_rank_card(user, msg_count, rank)
+    await interaction.followup.send(file=card_file)
 
 @bot.tree.command(name="webhook", description="Set the streak announcement webhook URL")
 async def set_webhook(interaction: discord.Interaction, url: str):
@@ -182,25 +209,34 @@ async def on_message(message):
     uid, gid = message.author.id, message.guild.id
 
     async with bot.db_pool.acquire() as conn:
+        # 1. TRACK GLOBAL MESSAGES (For /messages command)
+        await conn.execute('''
+            INSERT INTO message_stats (user_id, guild_id, total_messages) 
+            VALUES ($1, $2, 1) 
+            ON CONFLICT (user_id, guild_id) 
+            DO UPDATE SET total_messages = message_stats.total_messages + 1
+        ''', uid, gid)
+
+        # 2. TRACK STREAK LOGIC
         user = await conn.fetchrow("SELECT * FROM user_streaks WHERE user_id = $1 AND guild_id = $2", uid, gid)
         if not user:
             await conn.execute("INSERT INTO user_streaks (user_id, guild_id, messages_today, last_streak_date) VALUES ($1, $2, 1, $3)", uid, gid, today - timedelta(days=1))
             return
+        
         if user['last_streak_date'] == today: return
 
         current_streak = user['current_streak']
         msgs_today = user['messages_today']
 
-        # RESET CHECK
+        # Check for loss
         if user['last_streak_date'] < today - timedelta(days=1):
             current_streak = 0
             msgs_today = 0
-            # Update date to today immediately to prevent spamming loss message
-            await conn.execute('''UPDATE user_streaks SET current_streak = 0, messages_today = 0, last_streak_date = $1 
-                               WHERE user_id = $2 AND guild_id = $3''', today, uid, gid)
+            await conn.execute("UPDATE user_streaks SET current_streak = 0, messages_today = 0, last_streak_date = $1 WHERE user_id = $2 AND guild_id = $3", today, uid, gid)
             await remove_all_streak_roles(message.author)
             await fire_webhook(gid, f"💔 {message.author.mention}, You've lost your message streak!")
 
+        # Update progress
         new_msgs = msgs_today + 1
         if new_msgs >= 3:
             new_streak = current_streak + 1
@@ -215,6 +251,6 @@ async def on_message(message):
 @bot.event
 async def on_ready():
     await bot.tree.sync()
-    print(f"🚀 {bot.user} is live and fully loaded.")
+    print(f"🚀 {bot.user} is tracking messages and streaks.")
 
 bot.run(TOKEN)
