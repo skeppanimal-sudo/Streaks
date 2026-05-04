@@ -1,4 +1,4 @@
 discord.py
 asyncpg
 aiohttp
-easy-pillow
+git+https://github.com/mrehanabbasi/easy-pillow.git
