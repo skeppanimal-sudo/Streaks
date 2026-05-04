@@ -6,7 +6,7 @@ import os
 import io
 import aiohttp
 from datetime import datetime, timedelta, timezone
-from easy_pillow import Editor, Canvas, Font, load_image
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 # --- CONFIGURATION ---
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -22,7 +22,6 @@ class StreakBot(commands.Bot):
         self.db_pool = None
 
     async def setup_hook(self):
-        # Initialize Database Pool
         self.db_pool = await asyncpg.create_pool(DATABASE_URL)
         async with self.db_pool.acquire() as conn:
             # Table for Streaks
@@ -36,7 +35,7 @@ class StreakBot(commands.Bot):
                     PRIMARY KEY (user_id, guild_id)
                 )
             ''')
-            # Table for Global Message Counting and Ranking
+            # Table for Global Message Counting
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS message_stats (
                     user_id BIGINT,
@@ -73,11 +72,7 @@ class StreakBot(commands.Bot):
                 if not guild: continue
                 member = guild.get_member(record['user_id'])
                 if not member: continue
-
-                await conn.execute('''
-                    UPDATE user_streaks SET current_streak = 0, messages_today = 0, last_streak_date = $1 
-                    WHERE user_id = $2 AND guild_id = $3
-                ''', today, record['user_id'], record['guild_id'])
+                await conn.execute("UPDATE user_streaks SET current_streak = 0 WHERE user_id = $1 AND guild_id = $2", record['user_id'], record['guild_id'])
                 await remove_all_streak_roles(member)
                 await fire_webhook(record['guild_id'], f"💔 {member.mention}, You've lost your message streak!")
 
@@ -118,106 +113,91 @@ async def check_and_assign_roles(member, streak_count):
                 try: await member.add_roles(role)
                 except: pass
 
-# --- IMAGE GENERATION ---
+# --- IMAGE GENERATION (PILLOW) ---
 
 async def create_rank_card(user, msg_count, rank):
-    # Create Editor with background
+    # Create base
     try:
-        # Tries to load background.jpg from your folder
-        background = Editor("background.jpg").resize((900, 270))
+        bg = Image.open("background.jpg").convert("RGBA").resize((900, 270))
     except:
-        # Fallback if image isn't found
-        background = Editor(Canvas((900, 270), color="#1e1e1e"))
+        bg = Image.new("RGBA", (900, 270), (30, 30, 30, 255))
 
-    # Avatar processing
-    avatar_image = await load_image(str(user.display_avatar.url))
-    avatar = Editor(avatar_image).resize((170, 170)).circle_image()
-    
-    # Dark Overlay Box (Modern Rounded Look)
-    background.rectangle((25, 25), 850, 220, fill="#000000aa", radius=25)
-    
-    # Paste Avatar
-    background.paste(avatar, (50, 50))
-    
-    # Text Handling
-    white = "white"
-    blue = "#00d4ff"
-    yellow = "#ffcc4d"
-    
-    font_name = Font.poppins(variant="bold", size=45)
-    font_label = Font.poppins(variant="light", size=28)
-    font_value = Font.poppins(variant="bold", size=60)
+    # Dark overlay
+    draw = ImageDraw.Draw(bg)
+    overlay = Image.new("RGBA", (850, 220), (0, 0, 0, 160))
+    bg.paste(overlay, (25, 25), overlay)
 
-    # Name
-    background.text((250, 55), str(user.display_name), font=font_name, color=white)
+    # Avatar
+    async with aiohttp.ClientSession() as session:
+        async with session.get(str(user.display_avatar.url)) as r:
+            img_data = io.BytesIO(await r.read())
     
-    # Message Count Column
-    background.text((250, 130), "MESSAGE COUNT", font=font_label, color="#d1d1d1")
-    background.text((250, 170), str(msg_count), font=font_value, color=yellow)
-    
-    # Rank Column
-    background.text((600, 130), "SERVER RANK", font=font_label, color="#d1d1d1")
-    background.text((600, 170), f"#{rank}", font=font_value, color=blue)
+    avatar = Image.open(img_data).convert("RGBA").resize((170, 170))
+    mask = Image.new("L", (170, 170), 0)
+    ImageDraw.Draw(mask).ellipse((0, 0, 170, 170), fill=255)
+    avatar.putalpha(mask)
+    bg.paste(avatar, (50, 50), avatar)
 
-    # Convert to Discord File
-    file = discord.File(fp=background.image_bytes, filename="rank.png")
-    return file
+    # Text (Uses default if no font file is provided)
+    # You can upload a .ttf file to your repo and use it here
+    try:
+        f_name = ImageFont.load_default() 
+        f_val = ImageFont.load_default()
+    except:
+        f_name = f_val = None
+
+    draw.text((250, 60), str(user.display_name), fill="white")
+    draw.text((250, 130), f"MESSAGE COUNT: {msg_count}", fill="#ffcc4d")
+    draw.text((600, 130), f"SERVER RANK: #{rank}", fill="#00d4ff")
+
+    buf = io.BytesIO()
+    bg.save(buf, format="PNG")
+    buf.seek(0)
+    return discord.File(fp=buf, filename="rank.png")
 
 # --- COMMANDS ---
 
-@bot.tree.command(name="messages", description="View message count and rank card")
+@bot.tree.command(name="messages", description="Check user stats")
 async def messages(interaction: discord.Interaction, user: discord.Member = None):
     user = user or interaction.user
-    await interaction.response.defer() # Defer because image processing takes time
-
+    await interaction.response.defer()
     async with bot.db_pool.acquire() as conn:
-        # Get count
         row = await conn.fetchrow("SELECT total_messages FROM message_stats WHERE user_id = $1 AND guild_id = $2", user.id, interaction.guild_id)
         msg_count = row['total_messages'] if row else 0
-        
-        # Calculate Rank
         rank_data = await conn.fetch("SELECT user_id FROM message_stats WHERE guild_id = $1 ORDER BY total_messages DESC", interaction.guild_id)
-        rank = next((i + 1 for i, r in enumerate(rank_data) if r['user_id'] == user.id), "N/A")
+        rank = next((i + 1 for i, r in enumerate(rank_data) if r['user_id'] == user.id), "?")
+    
+    file = await create_rank_card(user, msg_count, rank)
+    await interaction.followup.send(file=file)
 
-    card_file = await create_rank_card(user, msg_count, rank)
-    await interaction.followup.send(file=card_file)
-
-@bot.tree.command(name="webhook", description="Set the streak announcement webhook URL")
+@bot.tree.command(name="webhook", description="Set webhook URL")
 async def set_webhook(interaction: discord.Interaction, url: str):
-    if not interaction.user.guild_permissions.manage_guild:
-        return await interaction.response.send_message("❌ Admin only.", ephemeral=True)
+    if not interaction.user.guild_permissions.manage_guild: return
     async with bot.db_pool.acquire() as conn:
         await conn.execute("INSERT INTO guild_settings (guild_id, webhook_url) VALUES ($1, $2) ON CONFLICT (guild_id) DO UPDATE SET webhook_url = $2", interaction.guild_id, url)
-    await interaction.response.send_message("✅ Webhook configured!", ephemeral=True)
+    await interaction.response.send_message("✅ Webhook Set!", ephemeral=True)
 
-@bot.tree.command(name="streak_roles", description="Set roles for milestones")
+@bot.tree.command(name="streak_roles", description="Set milestone roles")
 async def streak_roles(interaction: discord.Interaction, s2: discord.Role, s7: discord.Role, s14: discord.Role, s30: discord.Role, s50: discord.Role, s100: discord.Role):
-    if not interaction.user.guild_permissions.manage_roles:
-        return await interaction.response.send_message("❌ Admin only.", ephemeral=True)
+    if not interaction.user.guild_permissions.manage_roles: return
     async with bot.db_pool.acquire() as conn:
         await conn.execute('''INSERT INTO guild_settings (guild_id, role_2, role_7, role_14, role_30, role_50, role_100) VALUES ($1, $2, $3, $4, $5, $6, $7)
             ON CONFLICT (guild_id) DO UPDATE SET role_2=$2, role_7=$3, role_14=$4, role_30=$5, role_50=$6, role_100=$7''', 
             interaction.guild_id, s2.id, s7.id, s14.id, s30.id, s50.id, s100.id)
-    await interaction.response.send_message("✅ Milestone roles updated!", ephemeral=True)
+    await interaction.response.send_message("✅ Roles Configured!", ephemeral=True)
 
-# --- CORE LOGIC ---
+# --- TRACKING ---
 
 @bot.event
 async def on_message(message):
     if message.author.bot or not message.guild: return
-    today = datetime.now(timezone.utc).date()
-    uid, gid = message.author.id, message.guild.id
+    uid, gid, today = message.author.id, message.guild.id, datetime.now(timezone.utc).date()
 
     async with bot.db_pool.acquire() as conn:
-        # 1. TRACK GLOBAL MESSAGES (For /messages command)
-        await conn.execute('''
-            INSERT INTO message_stats (user_id, guild_id, total_messages) 
-            VALUES ($1, $2, 1) 
-            ON CONFLICT (user_id, guild_id) 
-            DO UPDATE SET total_messages = message_stats.total_messages + 1
-        ''', uid, gid)
-
-        # 2. TRACK STREAK LOGIC
+        # Total Count
+        await conn.execute("INSERT INTO message_stats (user_id, guild_id, total_messages) VALUES ($1, $2, 1) ON CONFLICT (user_id, guild_id) DO UPDATE SET total_messages = message_stats.total_messages + 1", uid, gid)
+        
+        # Streak Logic
         user = await conn.fetchrow("SELECT * FROM user_streaks WHERE user_id = $1 AND guild_id = $2", uid, gid)
         if not user:
             await conn.execute("INSERT INTO user_streaks (user_id, guild_id, messages_today, last_streak_date) VALUES ($1, $2, 1, $3)", uid, gid, today - timedelta(days=1))
@@ -225,32 +205,23 @@ async def on_message(message):
         
         if user['last_streak_date'] == today: return
 
-        current_streak = user['current_streak']
-        msgs_today = user['messages_today']
-
-        # Check for loss
         if user['last_streak_date'] < today - timedelta(days=1):
-            current_streak = 0
-            msgs_today = 0
             await conn.execute("UPDATE user_streaks SET current_streak = 0, messages_today = 0, last_streak_date = $1 WHERE user_id = $2 AND guild_id = $3", today, uid, gid)
             await remove_all_streak_roles(message.author)
-            await fire_webhook(gid, f"💔 {message.author.mention}, You've lost your message streak!")
+            await fire_webhook(gid, f"💔 {message.author.mention}, Streak lost!")
 
-        # Update progress
-        new_msgs = msgs_today + 1
+        new_msgs = user['messages_today'] + 1
         if new_msgs >= 3:
-            new_streak = current_streak + 1
+            new_streak = user['current_streak'] + 1
             await conn.execute("UPDATE user_streaks SET current_streak = $1, messages_today = 0, last_streak_date = $2 WHERE user_id = $3 AND guild_id = $4", new_streak, today, uid, gid)
-            await fire_webhook(gid, f"🔥 {message.author.mention}, You've acquired a Message Streak 🔥\n**Message Streak: {new_streak}**")
+            await fire_webhook(gid, f"🔥 {message.author.mention}, Streak: {new_streak}!")
             await check_and_assign_roles(message.author, new_streak)
         else:
-            await conn.execute("UPDATE user_streaks SET messages_today = $1, current_streak = $2 WHERE user_id = $3 AND guild_id = $4", new_msgs, current_streak, uid, gid)
-
-    await bot.process_commands(message)
+            await conn.execute("UPDATE user_streaks SET messages_today = $1 WHERE user_id = $2 AND guild_id = $3", new_msgs, uid, gid)
 
 @bot.event
 async def on_ready():
     await bot.tree.sync()
-    print(f"🚀 {bot.user} is tracking messages and streaks.")
+    print(f"🚀 {bot.user} Online")
 
 bot.run(TOKEN)
