@@ -93,38 +93,56 @@ async def fire_webhook(guild_id, content):
 # --- RANK CARD ---
 
 async def create_rank_card(user, msg_count, rank):
+    # Load your Cloud Background
     try:
         bg = Image.open("background.jpg").convert("RGBA").resize((1000, 330))
     except:
         bg = Image.new("RGBA", (1000, 330), (135, 206, 235, 255))
+    
     draw = ImageDraw.Draw(bg)
-    overlay = Image.new("RGBA", (940, 260), (0, 0, 0, 160)) 
+    
+    # The Rounded Dark Box (from image 66e5fa)
+    overlay = Image.new("RGBA", (940, 260), (32, 34, 37, 180)) # Darker grey like Discord
     bg.paste(overlay, (30, 35), overlay)
+
+    # Avatar
     async with aiohttp.ClientSession() as session:
         async with session.get(str(user.display_avatar.url)) as r:
             avatar_data = io.BytesIO(await r.read())
+    
     avatar = Image.open(avatar_data).convert("RGBA").resize((190, 190))
     mask = Image.new("L", (190, 190), 0)
     ImageDraw.Draw(mask).ellipse((0, 0, 190, 190), fill=255)
     avatar.putalpha(mask)
     bg.paste(avatar, (65, 70), avatar)
+
+    # Fonts (Load your Luckiest Guy font here)
     try:
         name_font = ImageFont.truetype("font.ttf", 60)
-        label_font = ImageFont.truetype("font.ttf", 40)
-        value_font = ImageFont.truetype("font.ttf", 85)
+        label_font = ImageFont.truetype("font.ttf", 45)
+        value_font = ImageFont.truetype("font.ttf", 95)
     except:
         name_font = label_font = value_font = ImageFont.load_default()
-    def draw_thick_text(pos, text, font, color):
+
+    # Thick Bubble Text Function
+    def draw_bubble_text(pos, text, font, color):
         x, y = pos
+        # Thick black outline (4px)
         for dx in range(-4, 5):
             for dy in range(-4, 5):
                 draw.text((x+dx, y+dy), text, font=font, fill="black")
+        # Main text
         draw.text(pos, text, font=font, fill=color)
-    draw_thick_text((290, 60), str(user.name), name_font, "white")
-    draw_thick_text((290, 150), "MESSAGE COUNT", label_font, "white")
-    draw_thick_text((290, 200), str(msg_count), value_font, "#FFCC4D")
-    draw_thick_text((680, 150), "WEEKLY RANK", label_font, "white")
-    draw_thick_text((680, 200), f"#{rank}", value_font, "#00D4FF")
+
+    # Drawing exactly as seen in Image 66e5fa
+    draw_bubble_text((290, 60), str(user.name), name_font, "white")
+    
+    draw_bubble_text((290, 150), "MESSAGE COUNT", label_font, "white")
+    draw_bubble_text((290, 210), str(msg_count), value_font, "#FFCC4D") # Yellow
+    
+    draw_bubble_text((680, 150), "WEEKLY RANK", label_font, "white")
+    draw_bubble_text((680, 210), f"#{rank}", value_font, "#00D4FF") # Blue
+
     buf = io.BytesIO()
     bg.save(buf, format="PNG")
     buf.seek(0)
